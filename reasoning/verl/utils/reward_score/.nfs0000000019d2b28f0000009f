@@ -1,0 +1,350 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2023-2024 SGLang Team
+# Copyright 2025 Search-R1 Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Adapted from https://github.com/PeterGriffinJin/Search-R1/blob/main/verl/utils/reward_score/qa_em.py
+
+import math
+import random
+import re
+import string
+from typing import Sequence
+
+import numpy as np
+
+TRAJECTORY_PATTERN = re.compile(r"<trajectory>(.*?)</trajectory>", re.IGNORECASE | re.DOTALL)
+COORDINATE_PATTERN = re.compile(r"[\(\[]\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*[\)\]]")
+FRAME_PATTERN = re.compile(r"<frame\s+(\d+)>", re.IGNORECASE)
+
+
+def normalize_answer(s):
+    def remove_articles(text):
+        return re.sub(r"\b(a|an|the)\b", " ", text)
+
+    def white_space_fix(text):
+        return " ".join(text.split())
+
+    def remove_punc(text):
+        exclude = set(string.punctuation)
+        return "".join(ch for ch in text if ch not in exclude)
+
+    def lower(text):
+        return text.lower()
+
+    return white_space_fix(remove_articles(remove_punc(lower(s))))
+
+
+def em_check(prediction, golden_answers):
+    if isinstance(golden_answers, str):
+        golden_answers = [golden_answers]
+    normalized_prediction = normalize_answer(prediction)
+    score = 0
+    for golden_answer in golden_answers:
+        golden_answer = normalize_answer(golden_answer)
+        if golden_answer == normalized_prediction:
+            score = 1
+            break
+    return score
+
+
+def subem_check(prediction, golden_answers):
+    if isinstance(golden_answers, str):
+        golden_answers = [golden_answers]
+    normalized_prediction = normalize_answer(prediction)
+    score = 0
+    for golden_answer in golden_answers:
+        golden_answer = normalize_answer(golden_answer)
+        if golden_answer in normalized_prediction:
+            score = 1
+            break
+    return score
+
+
+# def extract_solution(solution_str):
+#     """Extract the equation from the solution string."""
+#     # Remove everything before the first "Assistant:"
+#     # if "Assistant:" in solution_str:
+#     #     solution_str = solution_str.split("Assistant:", 1)[1]
+#     # elif "<|im_start|>assistant" in solution_str:
+#     #     solution_str = solution_str.split("<|im_start|>assistant", 1)[1]
+#     # else:
+#     #     return None
+#     # solution_str = solution_str.split('\n')[-1]
+
+#     answer_pattern = r"####(.*?)"
+#     match = re.finditer(answer_pattern, solution_str, re.DOTALL)
+#     matches = list(match)
+
+#     # If there are 0  matches, return None
+#     if len(matches) < 1:
+#         return None
+
+#     # If there are 2 or more matches, return the last one
+#     return matches[-1].group(1).strip()
+
+def extract_solution(solution_str):
+    """Extract the final answer portion from the solution string."""
+    if not solution_str:
+        return None
+
+    trajectory_matches = TRAJECTORY_PATTERN.findall(solution_str)
+    if trajectory_matches:
+        return trajectory_matches[-1].strip()
+
+    answer_pattern = r"####(.*)"
+    matches = list(re.finditer(answer_pattern, solution_str, re.DOTALL))
+
+    if len(matches) < 1:
+        return None
+
+    return matches[-1].group(1).strip()
+
+
+def count_answer_tags(text):
+    opening_tags = text.count("<answer>")
+    closing_tags = text.count("</answer>")
+
+    return opening_tags, closing_tags
+
+
+def _normalize_points_scale(points: list[list[float]]) -> list[list[float]]:
+    """Scale normalized coordinates to the 0-1000 pixel range when needed."""
+    if not points:
+        return []
+
+    normalized_points: list[list[float]] = []
+    max_value = 0.0
+    for point in points:
+        if len(point) < 2:
+            continue
+        x = float(point[0])
+        y = float(point[1])
+        normalized_points.append([x, y])
+        max_value = max(max_value, abs(x), abs(y))
+
+    if not normalized_points:
+        return []
+
+    scale = 1000.0 if 0 < max_value <= 2 else 1.0
+
+    if scale == 1.0:
+        return normalized_points
+
+    return [[x * scale, y * scale] for x, y in normalized_points]
+
+
+def _points_from_text(block: str) -> list[list[float]]:
+    """Extract numeric coordinate pairs from a block of text."""
+    points: list[list[float]] = []
+    for x_str, y_str in COORDINATE_PATTERN.findall(block):
+        try:
+            points.append([float(x_str), float(y_str)])
+        except ValueError:
+            continue
+    return points
+
+
+def parse_trajectory_points(source: str | Sequence | np.ndarray | None) -> list[list[float]]:
+    """Parse trajectory coordinates from strings, sequences, or numpy arrays."""
+    if source is None:
+        return []
+
+    if isinstance(source, str):
+        matches = TRAJECTORY_PATTERN.findall(source)
+        text = matches[-1] if matches else source
+        return _normalize_points_scale(_points_from_text(text))
+
+    if isinstance(source, dict):
+        for key in ("ground_truth", "target", "answer"):
+            if key in source:
+                return parse_trajectory_points(source[key])
+        return []
+
+    if isinstance(source, np.ndarray):
+        source = source.tolist()
+
+    if isinstance(source, Sequence):
+        collected: list[list[float]] = []
+        for entry in source:
+            if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                try:
+                    collected.append([float(entry[0]), float(entry[1])])
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(entry, str):
+                collected.extend(_points_from_text(entry))
+        return _normalize_points_scale(collected)
+
+    return []
+
+
+def parse_frame_id(source: str | Sequence | np.ndarray | dict | None) -> int | None:
+    """Extract the frame id from text, dicts, or nested sequences."""
+    if source is None:
+        return None
+
+    if isinstance(source, str):
+        matches = FRAME_PATTERN.findall(source)
+        if matches:
+            try:
+                return int(matches[-1])
+            except ValueError:
+                return None
+        return None
+
+    return None
+
+
+def calculate_dfd(seq1, seq2, num_samples=15, dist_func=None):
+    """
+    discrete_frechet_distance
+    seq1: 第一个序列，形状为 (m, d) 的数组，m是点数，d是维度
+    seq2: 第二个序列，形状为 (n, d) 的数组，n是点数，d是维度
+
+    return:
+    float: 两个序列的离散弗雷歇距离
+    """
+
+    if seq1 is None or seq2 is None or len(seq1) == 0 or len(seq2) == 0:
+        return 0.0
+
+    seq1 = uniform_trajectory_sampling(seq1, num_samples)
+    seq2 = uniform_trajectory_sampling(seq2, num_samples)
+
+    seq1 = np.array(seq1, dtype=float)
+    seq2 = np.array(seq2, dtype=float)
+    m, n = len(seq1), len(seq2)
+
+    if dist_func is None:
+
+        def dist_func(a, b):
+            return np.linalg.norm(np.array(a) - np.array(b))
+
+    C = np.zeros((m, n))
+    C[0, 0] = dist_func(seq1[0], seq2[0])
+
+    for i in range(1, m):
+        C[i, 0] = max(C[i - 1, 0], dist_func(seq1[i], seq2[0]))
+
+    for j in range(1, n):
+        C[0, j] = max(C[0, j - 1], dist_func(seq1[0], seq2[j]))
+
+    for i in range(1, m):
+        for j in range(1, n):
+            C[i, j] = max(
+                min(C[i - 1, j], C[i, j - 1], C[i - 1, j - 1]),
+                dist_func(seq1[i], seq2[j]),
+            )
+
+    return math.exp(-C[m - 1, n - 1])
+
+
+def uniform_trajectory_sampling(trajectory, n_points):
+    """
+    轨迹进行均匀采样
+    trajectory: 原始轨迹，形状为 (m, d) 的数组，m是点数，d是维度
+    n_points: 采样后的点数
+
+    return:
+    numpy.array: 采样后的轨迹，形状为 (n_points, d)
+    """
+
+    if trajectory is None or len(trajectory) == 0:
+        raise ValueError("Trajectory can not be None or empty")
+
+    if n_points <= 0:
+        raise ValueError("采样点数必须大于0")
+
+    trajectory = np.array(trajectory, dtype=float)
+
+    segment_lengths = np.sqrt(np.sum(np.diff(trajectory, axis=0) ** 2, axis=1))
+
+    cumulative_lengths = np.insert(np.cumsum(segment_lengths), 0, 0)
+    total_length = cumulative_lengths[-1]
+
+    if total_length == 0:
+        return np.tile(trajectory[0], (n_points, 1))
+
+    sampled_distances = np.linspace(0, total_length, n_points)
+
+    sampled_points = np.zeros((n_points, trajectory.shape[1]))
+    for i in range(trajectory.shape[1]):
+        sampled_points[:, i] = np.interp(sampled_distances, cumulative_lengths, trajectory[:, i])
+
+    return sampled_points
+
+
+def compute_score(
+    data_source,
+    solution_str,
+    ground_truth,
+    method="frechet",
+    format_score=0.0,
+    score=1.0,
+    extra_info=None,
+):
+    """Compute trajectory rewards with a discrete Fréchet similarity and frame id bonus."""
+    frame_reward = 0.0
+    gt_frame_id = parse_frame_id(ground_truth)
+    pred_frame_id = parse_frame_id(solution_str)
+    if gt_frame_id is not None and pred_frame_id is not None and gt_frame_id == pred_frame_id:
+        frame_reward = 0.25
+
+    gt_points = parse_trajectory_points(ground_truth)
+    pred_points = parse_trajectory_points(solution_str)
+
+    if random.randint(1, 64) == 32:
+        print("GT:", ground_truth , "GT Points:",     gt_points)
+        print("Pred:", solution_str, "Pred Points:", pred_points)
+
+    if not gt_points:
+        return format_score + frame_reward
+
+    if not pred_points:
+        return format_score + frame_reward
+
+    try:
+        reward = calculate_dfd(pred_points, gt_points)
+    except ValueError:
+        return format_score + frame_reward
+
+    return float(score * reward + frame_reward)
+
+
+def compute_score_subem(solution_str, ground_truth, method="strict", format_score=0.0, score=1.0):
+    """The scoring function for substring exact match (EM).
+
+    Args:
+        solution_str: the solution text
+        ground_truth: the ground truth
+        method: the method to extract the solution, choices are 'strict' and 'flexible'
+        format_score: the score for the format
+        score: the score for the correct answer
+    """
+    answer = extract_solution(solution_str=solution_str)
+    do_print = random.randint(1, 64) == 1
+
+    if do_print:
+        print("--------------------------------")
+        print(f"Golden answers: {ground_truth['target']}")
+        print(f"Extracted answer: {answer}")
+        print(f"Solution string: {solution_str}")
+
+    if answer is None:
+        return 0
+    else:
+        if subem_check(answer, ground_truth["target"]):
+            return score
+        else:
+            return format_score
