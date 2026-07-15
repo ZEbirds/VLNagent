@@ -5,9 +5,7 @@ __pycache__
 dist
 navigation/data
 models/
-visual_result/
 cookbooks/assets/cw/data/
-cw/results/
 *.tar.gz
 *.pth
 *.pdf
